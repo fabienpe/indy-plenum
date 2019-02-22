@@ -1,0 +1,17 @@
+Metadata-Version: 2.1
+Name: indy-plenum-dev
+Version: 1.6
+Summary: Plenum Byzantine Fault Tolerant Protocol
+Home-page: https://github.com/hyperledger/indy-plenum
+Author: Hyperledger
+Author-email: hyperledger-indy@lists.hyperledger.org
+Maintainer: Hyperledger
+Maintainer-email: hyperledger-indy@lists.hyperledger.org
+License: Apache 2.0
+Download-URL: https://github.com/hyperledger/indy-plenum/tarball/1.6
+Description: Plenum Byzantine Fault Tolerant Protocol
+Keywords: Byzantine Fault Tolerant Plenum
+Platform: UNKNOWN
+Provides-Extra: benchmark
+Provides-Extra: tests
+Provides-Extra: stats
