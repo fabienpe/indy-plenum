@@ -4,6 +4,7 @@ from enum import unique, IntEnum
 from functools import partial
 from hashlib import sha256
 from typing import List, Dict, Optional, Any, Set, Tuple, Callable, Iterable
+import itertools
 
 import math
 
@@ -22,7 +23,7 @@ from plenum.common.constants import THREE_PC_PREFIX, PREPREPARE, PREPARE, \
     ReplicaHooks, DOMAIN_LEDGER_ID, COMMIT, POOL_LEDGER_ID, AUDIT_LEDGER_ID, AUDIT_TXN_PP_SEQ_NO, AUDIT_TXN_VIEW_NO, \
     AUDIT_TXN_PRIMARIES
 from plenum.common.exceptions import SuspiciousNode, \
-    InvalidClientMessageException, UnknownIdentifier
+    InvalidClientMessageException, UnknownIdentifier, SuspiciousPrePrepare
 from plenum.common.hook_manager import HookManager
 from plenum.common.ledger import Ledger
 from plenum.common.message_processor import MessageProcessor
@@ -98,7 +99,7 @@ class Replica3PRouter(Router):
         try:
             super().handleSync(msg)
         except SuspiciousNode as ex:
-            self.replica.node.reportSuspiciousNodeEx(ex)
+            self.replica.report_suspicious_node(ex)
 
 
 class IntervalList:
@@ -201,6 +202,7 @@ PP_APPLY_HOOK_ERROR = 11
 PP_SUB_SEQ_NO_WRONG = 12
 PP_NOT_FINAL = 13
 PP_APPLY_AUDIT_HASH_MISMATCH = 15
+PP_REQUEST_ALREADY_ORDERED = 16
 
 
 def measure_replica_time(master_name: MetricsName, backup_name: MetricsName):
@@ -291,6 +293,15 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
         # None in case the replica does not know who the primary of the
         # instance is
         self._primaryName = None  # type: Optional[str]
+
+        # PRE-PREPAREs timestamps stored by non primary replica to check
+        # obsolescence of incoming PrePrepares. Pre-prepares with the same
+        # 3PC key are not merged since we need to keep incoming timestamps
+        # for each new PP from every nodes separately.
+        # Dictionary:
+        #   key: Tuple[pp.viewNo, pp.seqNo]
+        #   value: Dict[Tuple[PrePrepare, sender], timestamp]
+        self.pre_prepare_tss = defaultdict(dict)
 
         # PRE-PREPAREs that are waiting to be processed but do not have the
         # corresponding request finalised. Happens when replica has not been
@@ -603,8 +614,15 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
                 # decided.
                 return
             self._gc_before_new_view()
-            if self.viewNo > 0:
+            if self.__should_reset_watermarks_before_new_view():
                 self._reset_watermarks_before_new_view()
+
+    def __should_reset_watermarks_before_new_view(self):
+        if self.viewNo <= 0:
+            return False
+        if self.last_ordered_3pc[0] == self.viewNo and self.last_ordered_3pc[1] > 0:
+            return False
+        return True
 
     def compact_primary_names(self):
         min_allowed_view_no = self.viewNo - 1
@@ -646,10 +664,10 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
         if self.isMaster:
             return
         reqs_for_remove = []
-        for key in self.requests:
-            ledger_id, seq_no = self.node.seqNoDB.get(key)
+        for req in self.requests.values():
+            ledger_id, seq_no = self.node.seqNoDB.get_by_payload_digest(req.request.payload_digest)
             if seq_no is not None:
-                reqs_for_remove.append((key, ledger_id, seq_no))
+                reqs_for_remove.append((req.request.digest, ledger_id, seq_no))
         for key, ledger_id, seq_no in reqs_for_remove:
             self.requests.ordered_by_replica(key)
             self.requests.free(key)
@@ -976,6 +994,7 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
             key = self.requestQueues[ledger_id].pop(0)
             if key in self.requests:
                 fin_req = self.requests[key].finalised
+                malicious_req = False
                 try:
                     self.processReqDuringBatch(fin_req,
                                                tm)
@@ -984,9 +1003,13 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
                                         'will reject'.format(self, ex, fin_req))
                     rejects.append((fin_req.key, Reject(fin_req.identifier, fin_req.reqId, ex)))
                     invalid_indices.append(idx)
+                except SuspiciousPrePrepare:
+                    malicious_req = True
                 finally:
-                    reqs.append(fin_req)
-                idx += 1
+                    if not malicious_req:
+                        reqs.append(fin_req)
+                if not malicious_req:
+                    idx += 1
             else:
                 self.logger.debug('{} found {} in its request queue but the '
                                   'corresponding request was removed'.format(self, key))
@@ -1045,6 +1068,15 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
         """
         sender = self.generateName(sender, self.instId)
 
+        pp_key = ((msg.viewNo, msg.ppSeqNo) if
+                  isinstance(msg, PrePrepare) else None)
+
+        # the same PrePrepare might come here multiple times
+        if (pp_key and (msg, sender) not in self.pre_prepare_tss[pp_key]):
+            # TODO more clean solution would be to set timestamps
+            # earlier (e.g. in zstack)
+            self.pre_prepare_tss[pp_key][msg, sender] = self.get_time_for_3pc_batch()
+
         result, reason = self.validator.validate_3pc_msg(msg)
         if result == DISCARD:
             self.discard(msg, "{} discard message {} from {} "
@@ -1069,7 +1101,7 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
                 old_txn_root))
 
         # 1. APPLY
-        reqs, invalid_indices, rejects = self._apply_pre_prepare(pre_prepare)
+        reqs, invalid_indices, rejects, suspicious = self._apply_pre_prepare(pre_prepare)
 
         # 2. CHECK IF MORE CHUNKS NEED TO BE APPLIED FURTHER BEFORE VALIDATION
         if pre_prepare.sub_seq_no != 0:
@@ -1080,8 +1112,11 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
 
         # 3. VALIDATE APPLIED
         invalid_from_pp = invalid_index_serializer.deserialize(pre_prepare.discarded)
-        why_not_applied = self._validate_applied_pre_prepare(pre_prepare,
-                                                             reqs, invalid_indices, invalid_from_pp)
+        if suspicious:
+            why_not_applied = PP_REQUEST_ALREADY_ORDERED
+        else:
+            why_not_applied = self._validate_applied_pre_prepare(pre_prepare,
+                                                                 reqs, invalid_indices, invalid_from_pp)
 
         # 4. IF NOT VALID AFTER APPLYING - REVERT
         if why_not_applied is not None:
@@ -1143,7 +1178,7 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
 
         def report_suspicious(reason):
             ex = SuspiciousNode(sender, reason, pre_prepare)
-            self.node.reportSuspiciousNodeEx(ex)
+            self.report_suspicious_node(ex)
 
         why_not = self._can_process_pre_prepare(pre_prepare, sender)
         if why_not is None:
@@ -1167,6 +1202,8 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
                     return
                 elif why_not_applied == PP_APPLY_AUDIT_HASH_MISMATCH:
                     report_suspicious(Suspicions.PPR_AUDIT_TXN_ROOT_HASH_WRONG)
+                elif why_not_applied == PP_REQUEST_ALREADY_ORDERED:
+                    report_suspicious(Suspicions.PPR_WITH_ORDERED_REQUEST)
         elif why_not == PP_CHECK_NOT_FROM_PRIMARY:
             report_suspicious(Suspicions.PPR_FRM_NON_PRIMARY)
         elif why_not == PP_CHECK_TO_PRIMARY:
@@ -1181,11 +1218,14 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
         elif why_not == PP_CHECK_REQUEST_NOT_FINALIZED:
             absents = set()
             non_fin = set()
+            non_fin_payload = set()
             for key in pre_prepare.reqIdr:
-                if key not in self.requests:
+                req = self.requests.get(key)
+                if req is None:
                     absents.add(key)
-                elif not self.requests[key].finalised:
+                elif not req.finalised:
                     non_fin.add(key)
+                    non_fin_payload.add(req.request.payload_digest)
             absent_str = ', '.join(str(key) for key in absents)
             non_fin_str = ', '.join(
                 '{} ({} : {})'.format(str(key),
@@ -1197,13 +1237,25 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
                 "{} of them don't have enough propagates: {}.".format(self, pre_prepare.ledgerId,
                                                                       len(absents), absent_str,
                                                                       len(non_fin), non_fin_str))
-            bad_reqs = absents | non_fin
-            for req in bad_reqs:
-                if req not in self.requests and self.node.seqNoDB.get(req) != (None, None):
-                    self.logger.info("Request digest {} already ordered. Discard {} "
-                                     "from {}".format(req, pre_prepare, sender))
-                    report_suspicious(Suspicions.PPR_WITH_ORDERED_REQUEST)
+
+            def signal_suspicious(req):
+                self.logger.info("Request digest {} already ordered. Discard {} "
+                                 "from {}".format(req, pre_prepare, sender))
+                report_suspicious(Suspicions.PPR_WITH_ORDERED_REQUEST)
+
+            # checking for payload digest is more effective
+            for payload_key in non_fin_payload:
+                if self.node.seqNoDB.get_by_payload_digest(payload_key) != (None, None):
+                    signal_suspicious(payload_key)
                     return
+
+            # for absents we can only check full digest
+            for full_key in absents:
+                if self.node.seqNoDB.get_by_full_digest(full_key) is not None:
+                    signal_suspicious(full_key)
+                    return
+
+            bad_reqs = absents | non_fin
             self.enqueue_pre_prepare(pre_prepare, sender, bad_reqs)
             # TODO: An optimisation might be to not request PROPAGATEs
             # if some PROPAGATEs are present or a client request is
@@ -1274,7 +1326,7 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
                 # handled and possibly logged higher
                 self.logger.trace("{} cannot process incoming PREPARE".format(self))
         except SuspiciousNode as ex:
-            self.node.reportSuspiciousNodeEx(ex)
+            self.report_suspicious_node(ex)
 
     @measure_replica_time(MetricsName.PROCESS_COMMIT_TIME,
                           MetricsName.BACKUP_PROCESS_COMMIT_TIME)
@@ -1388,12 +1440,8 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
         if last_pp_view_no > view_no:
             return False
         if last_pp_view_no < view_no:
-            # TODO: strange assumption here ???
             if view_no != self.viewNo:
-                raise LogicError(
-                    "{} 'view_no' {} is not equal to current view_no {}"
-                    .format(self, view_no, self.viewNo)
-                )
+                return False
             last_pp_seq_no = 0
         if pp_seq_no - last_pp_seq_no > 1:
             return False
@@ -1433,6 +1481,7 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
         idx = 0
         rejects = []
         invalid_indices = []
+        suspicious = False
 
         # 1. apply each request
         for req_key in pre_prepare.reqIdr:
@@ -1440,11 +1489,13 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
             try:
                 self.processReqDuringBatch(req,
                                            pre_prepare.ppTime)
-            except (InvalidClientMessageException, UnknownIdentifier) as ex:
+            except (InvalidClientMessageException, UnknownIdentifier, SuspiciousPrePrepare) as ex:
                 self.logger.warning('{} encountered exception {} while processing {}, '
                                     'will reject'.format(self, ex, req))
                 rejects.append((req.key, Reject(req.identifier, req.reqId, ex)))
                 invalid_indices.append(idx)
+                if isinstance(ex, SuspiciousPrePrepare):
+                    suspicious = True
             finally:
                 reqs.append(req)
             idx += 1
@@ -1461,7 +1512,7 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
                                                                reqs, invalid_indices))
             self.node.onBatchCreated(three_pc_batch)
 
-        return reqs, invalid_indices, rejects
+        return reqs, invalid_indices, rejects, suspicious
 
     def _validate_applied_pre_prepare(self, pre_prepare: PrePrepare,
                                       reqs, invalid_indices, invalid_from_pp) -> Optional[int]:
@@ -1502,15 +1553,15 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
         if (pre_prepare.viewNo, pre_prepare.ppSeqNo) in self.prePrepares:
             return PP_CHECK_DUPLICATE
 
+        if not self.is_pre_prepare_time_acceptable(pre_prepare, sender):
+            return PP_CHECK_WRONG_TIME
+
         if compare_3PC_keys((pre_prepare.viewNo, pre_prepare.ppSeqNo),
                             self.__last_pp_3pc) > 0:
             return PP_CHECK_OLD  # ignore old pre-prepare
 
         if self.nonFinalisedReqs(pre_prepare.reqIdr):
             return PP_CHECK_REQUEST_NOT_FINALIZED
-
-        if not self.is_pre_prepare_time_acceptable(pre_prepare):
-            return PP_CHECK_WRONG_TIME
 
         if not self.__is_next_pre_prepare(pre_prepare.viewNo,
                                           pre_prepare.ppSeqNo):
@@ -1780,7 +1831,8 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
             if viewNo not in self.stashed_out_of_order_commits:
                 self.stashed_out_of_order_commits[viewNo] = {}
             self.stashed_out_of_order_commits[viewNo][ppSeqNo] = commit
-            self.startRepeating(self.process_stashed_out_of_order_commits, 1)
+            self.startRepeating(self.process_stashed_out_of_order_commits,
+                                self.config.PROCESS_STASHED_OUT_OF_ORDER_COMMITS_INTERVAL)
             return False, "stashing {} since out of order". \
                 format(commit)
 
@@ -2231,16 +2283,24 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
         self.logger.info("{} cleaning up till {}".format(self, till3PCKey))
         tpcKeys = set()
         reqKeys = set()
-        for key3PC, pp in self.sentPrePrepares.items():
+
+        for key3PC, pp in itertools.chain(
+            self.sentPrePrepares.items(),
+            self.prePrepares.items()
+        ):
             if compare_3PC_keys(till3PCKey, key3PC) <= 0:
                 tpcKeys.add(key3PC)
                 for reqKey in pp.reqIdr:
                     reqKeys.add(reqKey)
-        for key3PC, pp in self.prePrepares.items():
+
+        for key3PC, pp_dict in self.pre_prepare_tss.items():
             if compare_3PC_keys(till3PCKey, key3PC) <= 0:
                 tpcKeys.add(key3PC)
-                for reqKey in pp.reqIdr:
-                    reqKeys.add(reqKey)
+                # TODO INDY-1983: was found that it adds additional
+                # requests to clean, need to explore why
+                # for (pp, _) in pp_dict:
+                #    for reqKey in pp.reqIdr:
+                #        reqKeys.add(reqKey)
 
         self.logger.trace("{} found {} 3-phase keys to clean".
                           format(self, len(tpcKeys)))
@@ -2248,6 +2308,7 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
                           format(self, len(reqKeys)))
 
         to_clean_up = (
+            self.pre_prepare_tss,
             self.sentPrePrepares,
             self.prePrepares,
             self.prepares,
@@ -2256,7 +2317,7 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
             self.requested_pre_prepares,
             self.requested_prepares,
             self.requested_commits,
-            self.pre_prepares_stashed_for_incorrect_time,
+            self.pre_prepares_stashed_for_incorrect_time
         )
         for request_key in tpcKeys:
             for coll in to_clean_up:
@@ -2634,7 +2695,7 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
     def process_requested_commit(self, commit: Commit, sender: str):
         return self._process_requested_three_phase_msg(commit, sender, self.requested_commits)
 
-    def is_pre_prepare_time_correct(self, pp: PrePrepare) -> bool:
+    def is_pre_prepare_time_correct(self, pp: PrePrepare, sender: str) -> bool:
         """
         Check if this PRE-PREPARE is not older than (not checking for greater
         than since batches maybe sent in less than 1 second) last PRE-PREPARE
@@ -2642,11 +2703,21 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
         :param pp:
         :return:
         """
-        return ((self.last_accepted_pre_prepare_time is None or
-                 pp.ppTime >= self.last_accepted_pre_prepare_time) and
-                (abs(pp.ppTime - self.utc_epoch) <= self.config.ACCEPTABLE_DEVIATION_PREPREPARE_SECS))
+        tpcKey = (pp.viewNo, pp.ppSeqNo)
 
-    def is_pre_prepare_time_acceptable(self, pp: PrePrepare) -> bool:
+        if (self.last_accepted_pre_prepare_time and
+                pp.ppTime < self.last_accepted_pre_prepare_time):
+            return False
+        elif ((tpcKey not in self.pre_prepare_tss) or
+                ((pp, sender) not in self.pre_prepare_tss[tpcKey])):
+            return False
+        else:
+            return (
+                abs(pp.ppTime - self.pre_prepare_tss[tpcKey][pp, sender]) <=
+                self.config.ACCEPTABLE_DEVIATION_PREPREPARE_SECS
+            )
+
+    def is_pre_prepare_time_acceptable(self, pp: PrePrepare, sender: str) -> bool:
         """
         Returns True or False depending on the whether the time in PRE-PREPARE
         is acceptable. Can return True if time is not acceptable but sufficient
@@ -2658,7 +2729,7 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
         if key in self.requested_pre_prepares:
             # Special case for requested PrePrepares
             return True
-        correct = self.is_pre_prepare_time_correct(pp)
+        correct = self.is_pre_prepare_time_correct(pp, sender)
         if not correct:
             if key in self.pre_prepares_stashed_for_incorrect_time and \
                     self.pre_prepares_stashed_for_incorrect_time[key][-1]:
@@ -2864,3 +2935,13 @@ class Replica(HasActionQueue, MessageProcessor, HookManager):
 
     def get_valid_req_ids_from_all_requests(self, reqs, invalid_indices):
         return [req.key for idx, req in enumerate(reqs) if idx not in invalid_indices]
+
+    def report_suspicious_node(self, ex):
+        if self.isMaster:
+            self.node.reportSuspiciousNodeEx(ex)
+        else:
+            self.warn_suspicious_backup(ex.node, ex.reason, ex.code)
+
+    def warn_suspicious_backup(self, nodeName, reason, code):
+        self.logger.warning("backup replica {} raised suspicion on node {} for {}; suspicion code "
+                            "is {}".format(self, nodeName, reason, code))

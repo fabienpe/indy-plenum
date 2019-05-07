@@ -25,7 +25,7 @@ import json
 import asyncio
 
 from indy.ledger import sign_and_submit_request, sign_request, submit_request, build_node_request, \
-    build_pool_config_request
+    build_pool_config_request, multi_sign_request
 from indy.error import ErrorCode, IndyError
 
 from ledger.genesis_txn.genesis_txn_file_util import genesis_txn_file
@@ -46,7 +46,7 @@ from plenum.test.msgs import randomMsg
 from plenum.test.spy_helpers import getLastClientReqReceivedForNode, getAllArgs, getAllReturnVals, \
     getAllMsgReceivedForNode
 from plenum.test.test_node import TestNode, TestReplica, \
-    getPrimaryReplica
+    getPrimaryReplica, getNonPrimaryReplicas
 from stp_core.common.log import getlogger
 from stp_core.loop.eventually import eventuallyAll, eventually
 from stp_core.loop.looper import Looper
@@ -311,7 +311,7 @@ def checkPrePrepareReqSent(replica: TestReplica, req: Request):
     prePreparesSent = getAllArgs(replica, replica.sendPrePrepare)
     expectedDigest = TestReplica.batchDigest([req])
     assert expectedDigest in [p["ppReq"].digest for p in prePreparesSent]
-    assert [req.digest, ] in \
+    assert (req.digest,) in \
            [p["ppReq"].reqIdr for p in prePreparesSent]
 
 
@@ -328,8 +328,8 @@ def checkPrepareReqSent(replica: TestReplica, key: str,
     rv = getAllReturnVals(replica,
                           replica.canPrepare)
     args = [p["ppReq"].reqIdr for p in paramsList if p["ppReq"].viewNo == view_no]
-    assert [key] in args
-    idx = args.index([key])
+    assert (key,) in args
+    idx = args.index((key,))
     assert rv[idx]
 
 
@@ -443,6 +443,10 @@ def whitelistClient(toWhitelist: str, frm: Sequence[TestNode], *codes):
 
 def assertExp(condition):
     assert condition
+
+
+def assert_eq(actual, expected):
+    assert actual == expected
 
 
 def assertFunc(func):
@@ -797,12 +801,26 @@ def sdk_sign_request_objects(looper, sdk_wallet, reqs: Sequence):
     return reqs
 
 
+def sdk_multi_sign_request_objects(looper, sdk_wallets, reqs: Sequence):
+    reqs_str = [json.dumps(req.as_dict) for req in reqs]
+    for sdk_wallet in sdk_wallets:
+        wallet_h, did = sdk_wallet
+        reqs_str = [looper.loop.run_until_complete(multi_sign_request(wallet_h, did, req))
+                    for req in reqs_str]
+    return reqs_str
+
+
 def sdk_sign_request_strings(looper, sdk_wallet, reqs: Sequence):
     wallet_h, did = sdk_wallet
     reqs_str = [json.dumps(req) for req in reqs]
     reqs = [looper.loop.run_until_complete(sign_request(wallet_h, did, req))
             for req in reqs_str]
     return reqs
+
+
+def sdk_multisign_request_object(looper, sdk_wallet, req):
+    wh, did = sdk_wallet
+    return looper.loop.run_until_complete(multi_sign_request(wh, did, req))
 
 
 def sdk_signed_random_requests(looper, sdk_wallet, count):
@@ -1063,7 +1081,7 @@ def sdk_check_request_is_not_returned_to_nodes(looper, nodeSet, request):
 
 
 def sdk_json_to_request_object(json_req):
-    return Request(identifier=json_req['identifier'],
+    return Request(identifier=json_req.get('identifier', None),
                    reqId=json_req['reqId'],
                    operation=json_req['operation'],
                    signature=json_req['signature'] if 'signature' in json_req else None,
@@ -1098,21 +1116,25 @@ def perf_monitor_disabled(tconf):
 
 
 @contextmanager
-def view_change_timeout(tconf, vc_timeout, catchup_timeout=None, propose_timeout=None):
+def view_change_timeout(tconf, vc_timeout, catchup_timeout=None, propose_timeout=None, ic_timeout=None):
     old_catchup_timeout = tconf.MIN_TIMEOUT_CATCHUPS_DONE_DURING_VIEW_CHANGE
     old_view_change_timeout = tconf.VIEW_CHANGE_TIMEOUT
     old_propose_timeout = tconf.INITIAL_PROPOSE_VIEW_CHANGE_TIMEOUT
     old_propagate_request_delay = tconf.PROPAGATE_REQUEST_DELAY
+    old_ic_timeout = tconf.INSTANCE_CHANGE_TIMEOUT
     tconf.MIN_TIMEOUT_CATCHUPS_DONE_DURING_VIEW_CHANGE = \
         0.6 * vc_timeout if catchup_timeout is None else catchup_timeout
     tconf.VIEW_CHANGE_TIMEOUT = vc_timeout
     tconf.INITIAL_PROPOSE_VIEW_CHANGE_TIMEOUT = vc_timeout if propose_timeout is None else propose_timeout
     tconf.PROPAGATE_REQUEST_DELAY = 0
+    if ic_timeout is not None:
+        tconf.INSTANCE_CHANGE_TIMEOUT = ic_timeout
     yield tconf
     tconf.MIN_TIMEOUT_CATCHUPS_DONE_DURING_VIEW_CHANGE = old_catchup_timeout
     tconf.VIEW_CHANGE_TIMEOUT = old_view_change_timeout
     tconf.INITIAL_PROPOSE_VIEW_CHANGE_TIMEOUT = old_propose_timeout
     tconf.PROPAGATE_REQUEST_DELAY = old_propagate_request_delay
+    tconf.INSTANCE_CHANGE_TIMEOUT = old_ic_timeout
 
 
 @contextmanager
@@ -1274,6 +1296,11 @@ def incoming_3pc_msgs_count(nodes_count: int = 4) -> int:
     # The primary node receives the same number of messages. Doesn't get pre-prepare,
     # but gets one more prepare
     return pre_prepare + prepares + commits
+
+
+def check_missing_pre_prepares(nodes, count):
+    assert all(count <= len(replica.prePreparesPendingPrevPP)
+               for replica in getNonPrimaryReplicas(nodes, instId=0))
 
 
 class MockTimestamp:

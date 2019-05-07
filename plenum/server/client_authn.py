@@ -247,13 +247,11 @@ class CoreAuthMixin:
                     ex = ex(req_data.get(f.IDENTIFIER.nm), req_data.get(f.SIG.nm))
                 raise ex
         else:
-            signatures = req_data[f.SIGS.nm]
+            signatures = req_data.get(f.SIGS.nm, None)
         return self.authenticate_multi(to_serialize, signatures=signatures,
                                        threshold=threshold, verifier=verifier)
 
     def serializeForSig(self, msg, identifier=None, topLevelKeysToIgnore=None):
-        if not msg.get(f.IDENTIFIER.nm):
-            msg = {**msg, f.IDENTIFIER.nm: identifier}
         return serialize_msg_for_signing(
             msg, topLevelKeysToIgnore=topLevelKeysToIgnore)
 
