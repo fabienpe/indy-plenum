@@ -2122,10 +2122,6 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
                     self.discard(msg_dict,
                                  reason="view change in progress",
                                  logMethod=logger.debug)
-                    self.send_nack_to_client((idr_from_req_data(msg_dict),
-                                              msg_dict.get(f.REQ_ID.nm, None)),
-                                             "Client request is discarded since view "
-                                             "change is in progress", frm)
                     return
             self.postToClientInBox(msg, frm)
 
@@ -2500,11 +2496,11 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
         r_taa_a_ts = request.taaAcceptance[f.TAA_ACCEPTANCE_TIME.nm]
         ts_lowest = (
             taa_txn_time -
-            self.config.TXN_AUTHOR_AGREEMENT_ACCEPANCE_TIME_BEFORE_TAA_TIME
+            self.config.TXN_AUTHOR_AGREEMENT_ACCEPTANCE_TIME_BEFORE_TAA_TIME
         )
         ts_higest = (
             req_pp_time +
-            self.config.TXN_AUTHOR_AGREEMENT_ACCEPANCE_TIME_AFTER_PP_TIME
+            self.config.TXN_AUTHOR_AGREEMENT_ACCEPTANCE_TIME_AFTER_PP_TIME
         )
         if (r_taa_a_ts < ts_lowest) or (r_taa_a_ts > ts_higest):
             raise InvalidClientTaaAcceptanceError(
