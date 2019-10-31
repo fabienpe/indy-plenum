@@ -11,17 +11,13 @@ from crypto.bls.bls_bft_replica import BlsBftReplica
 from orderedset import OrderedSet
 
 from plenum.common.config_util import getConfig
-from plenum.common.constants import THREE_PC_PREFIX, PREPREPARE, PREPARE, \
-    DOMAIN_LEDGER_ID, COMMIT, POOL_LEDGER_ID, AUDIT_LEDGER_ID, AUDIT_TXN_PP_SEQ_NO, AUDIT_TXN_VIEW_NO, \
-    AUDIT_TXN_PRIMARIES, TS_LABEL
+from plenum.common.constants import DOMAIN_LEDGER_ID, AUDIT_LEDGER_ID, TS_LABEL
 from plenum.common.event_bus import InternalBus, ExternalBus
 from plenum.common.exceptions import SuspiciousNode
 from plenum.common.message_processor import MessageProcessor
-from plenum.common.messages.internal_messages import NeedBackupCatchup, CheckpointStabilized, RaisedSuspicion, \
-    NewViewAccepted
-from plenum.common.messages.message_base import MessageBase
-from plenum.common.messages.node_messages import Ordered, \
-    PrePrepare, Prepare, Commit, ThreePhaseKey
+from plenum.common.messages.internal_messages import NeedBackupCatchup, RaisedSuspicion, NewViewAccepted, \
+    CheckpointStabilized
+from plenum.common.messages.node_messages import Ordered, Commit
 from plenum.common.metrics_collector import NullMetricsCollector, MetricsCollector, MetricsName
 from plenum.common.request import ReqKey
 from plenum.common.router import Subscription
@@ -34,7 +30,7 @@ from plenum.server.consensus.ordering_service import OrderingService
 from plenum.server.consensus.view_change_service import ViewChangeService
 from plenum.server.has_action_queue import HasActionQueue
 from plenum.server.replica_freshness_checker import FreshnessChecker
-from plenum.server.replica_helper import replica_batch_digest, TPCStat
+from plenum.server.replica_helper import replica_batch_digest
 from plenum.server.replica_validator import ReplicaValidator
 from plenum.server.replica_validator_enums import STASH_VIEW_3PC, STASH_CATCH_UP
 from plenum.server.router import Router
@@ -392,23 +388,10 @@ class Replica(HasActionQueue, MessageProcessor):
         if self.isMaster:
             return
 
-        self._clear_all_3pc_msgs()
-        reqs_for_remove = []
-        for req in self.requests.values():
-            ledger_id, seq_no = self.node.seqNoDB.get_by_payload_digest(req.request.payload_digest)
-            if seq_no is not None:
-                reqs_for_remove.append((req.request.digest, ledger_id, seq_no))
-        for key, ledger_id, seq_no in reqs_for_remove:
-            self.requests.ordered_by_replica(key)
-            self.requests.free(key)
-            self._ordering_service.requestQueues[int(ledger_id)].discard(key)
-        # TODO: Probably this needs to be removed since it is already done in CheckpointService
-        self.last_ordered_3pc = (self.viewNo, 0)
+        self._internal_bus.send(CheckpointStabilized(self.last_ordered_3pc))
         self._ordering_service._lastPrePrepareSeqNo = 0
-        self._checkpointer.set_watermarks(0)
-        self._checkpointer._reset_checkpoints()
-        self._consensus_data.stable_checkpoint = 0
-        self._checkpointer._remove_received_checkpoints(till_3pc_key=(self.viewNo, 0))
+        self._ordering_service.last_ordered_3pc = (self.viewNo, 0)
+        self._clear_all_3pc_msgs()
 
     def on_propagate_primary_done(self):
         if self.isMaster:

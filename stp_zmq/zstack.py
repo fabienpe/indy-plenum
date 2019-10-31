@@ -367,6 +367,7 @@ class ZStack(NetworkInterface):
         self.listener = self.ctx.socket(zmq.ROUTER)
         self._client_message_provider.listener = self.listener
         self.listener.setsockopt(zmq.ROUTER_MANDATORY, 1)
+        self.listener.setsockopt(zmq.ROUTER_HANDOVER, self.config.ROUTER_HANDOVER)
         if self.create_listener_monitor:
             self.listener_monitor = self.listener.get_monitor_socket()
         # noinspection PyUnresolvedReferences
@@ -717,7 +718,9 @@ class ZStack(NetworkInterface):
         msg = self.pingMessage if is_ping else self.pongMessage
         action = 'ping' if is_ping else 'pong'
         name = remote if isinstance(remote, (str, bytes)) else remote.name
-        r = self.send(msg, name)
+        # Do not use Batches for sending health messages
+        r = self.transmit(msg, name, is_batch=False)
+        # r = self.send(msg, name)
         if r[0] is True:
             logger.debug('{} {}ed {}'.format(self.name, action, z85_to_friendly(name)))
         elif r[0] is False:
@@ -787,6 +790,7 @@ class ZStack(NetworkInterface):
             return self._client_message_provider.transmit_through_listener(msg,
                                                                            remoteName)
         else:
+            is_batch = isinstance(msg, Mapping) and msg.get(OP_FIELD_NAME) == BATCH
             if remoteName is None:
                 r = []
                 e = []
@@ -799,16 +803,16 @@ class ZStack(NetworkInterface):
                     logger.warning(err_str)
                     return False, err_str
                 for uid in self.remotes:
-                    res, err = self.transmit(msg, uid, serialized=True)
+                    res, err = self.transmit(msg, uid, serialized=True, is_batch=is_batch)
                     r.append(res)
                     e.append(err)
                 e = list(filter(lambda x: x is not None, e))
                 ret_err = None if len(e) == 0 else "\n".join(e)
                 return all(r), ret_err
             else:
-                return self.transmit(msg, remoteName)
+                return self.transmit(msg, remoteName, is_batch=is_batch)
 
-    def transmit(self, msg, uid, timeout=None, serialized=False):
+    def transmit(self, msg, uid, timeout=None, serialized=False, is_batch=False):
         remote = self.remotes.get(uid)
         err_str = None
         if not remote:
